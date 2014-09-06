@@ -1,0 +1,16 @@
+Reference code
+
+This toolkit includes the processor power management (PPM) reference code
+normally run by your BIOS (assuming your BIOS did the right thing and used
+Intel's reference code; accept no substitutes).  If you boot this toolkit on
+a processor that the reference code knows how to handle (currently
+Nehalem/Westmere family processors only), then you will have a menu option to
+run the reference code and override the ACPI tables written by your BIOS.
+You can then use the menu item to boot your OS from your disk, and you should
+find that your processor power management works better (or perhaps that it
+works at all).
+
+If this reference code produces better results on your system than your
+existing BIOS configuration, or if it produces identical results, then you
+may want to incoporate this official Intel reference code into your BIOS as a
+replacement for your existing power management configuration code.

@@ -1,0 +1,305 @@
+#!/bin/sh
+
+# Copyright (c) 2014, Intel Corporation
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#    * Redistributions of source code must retain the above copyright notice,
+#      this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above copyright notice,
+#      this list of conditions and the following disclaimer in the documentation
+#      and/or other materials provided with the distribution.
+#    * Neither the name of Intel Corporation nor the names of its contributors
+#      may be used to endorse or promote products derived from this software
+#      without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+# ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# stop on error
+set -e
+
+localfiles=false
+for arg in "$@" ; do
+    if [ "$arg" = "local" ] ; then
+        localfiles=true
+        echo "Including local-files in the build; DO NOT DISTRIBUTE THIS BUILD."
+    fi
+done
+
+workdir="$(mktemp -d)"
+trap "rm -rf $workdir" 0
+export CCACHE_BASEDIR="$workdir"
+
+# Find GRUB source
+export BITS="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "$grub_src" ] ; then
+    grub_src="$BITS/../grub"
+fi
+if ! [ -d "$grub_src" ] || ! [ -x "$grub_src/autogen.sh" ] ; then
+    echo "Could not find grub source; looked in \"$grub_src\".  Please export grub_src=/path/to/grub" 1>&2
+    exit 1
+fi
+if [ -f $grub_src/Makefile ] ; then
+    echo "GRUB source directory not clean; please make maintainer-clean first" 1>&2
+    exit 1
+fi
+
+PYTHON_SRC="$BITS/../Python"
+
+# Verify clean Python source directory
+if [ -f $PYTHON_SRC/Makefile ] ; then
+    echo "Python source directory not clean; please make distclean first" 1>&2
+    exit 1
+fi
+
+grub_src_orig="$grub_src"
+grub_src="$workdir/grub"
+cp -a "$grub_src_orig" "$grub_src"
+
+export GRUB_CONTRIB="$workdir/bits"
+cp -a "$BITS/rc" "$GRUB_CONTRIB"
+
+mkdir -p "$grub_src/grub-core/contrib-deps"
+
+check_source() {
+    if ! [ -d "$2" ] ; then
+        echo "Could not find $1 source in \"$2\"." 1>&2
+        echo "Please extract the $1 source included with BITS to that location." 1>&2
+        exit 1
+    fi
+    cp -a "$2" "$grub_src/grub-core/contrib-deps/$3"
+}
+
+check_source Python "$PYTHON_SRC" python
+check_source fdlibm "$BITS/../fdlibm" fdlibm
+check_source ACPICA "$BITS/../acpica-unix2" acpica
+
+libffi_ffi_h="$grub_src/grub-core/contrib-deps/python/Modules/_ctypes/libffi/include/ffi.h"
+sed -e 's/#ifndef @TARGET@/#ifdef GRUB_TARGET_CPU_I386/' \
+    -e 's/#define @TARGET@/#define X86\n#else\n#define X86_64/' \
+    -e 's/@HAVE_LONG_DOUBLE@/0/' \
+    -e 's/@FFI_EXEC_TRAMPOLINE_TABLE@/0/' \
+    "${libffi_ffi_h}.in" > "$libffi_ffi_h"
+sed -e 's/@PLT//' \
+    -i "$grub_src/grub-core/contrib-deps/python/Modules/_ctypes/libffi/src/x86/unix64.S"
+
+# Figure out the commit ID of $BITS
+buildid="$(cd "$BITS" && (git rev-parse HEAD 2>/dev/null || echo "Unknown - not built from repository"))"
+buildnum="$(cd "$BITS" && git rev-list HEAD 2>/dev/null | wc -l)"
+if [ $buildnum -eq 0 ] ; then
+    buildnum="snapshot"
+fi
+
+prefix=$workdir/grub-inst
+target=$workdir/bits-$buildnum
+
+# Figure out the number of processors to use for a parallel build
+if command -v nproc >/dev/null 2>&1; then
+    cpus=$(nproc)
+elif [ -r /proc/cpuinfo ] ; then
+    cpus=$(grep -c '^processor' /proc/cpuinfo)
+else
+    cpus=1
+fi
+export cpus
+if [ $cpus -ne 1 ] ; then
+    echo Doing a parallel build on $cpus processors.
+fi
+
+# build commands
+cd "$grub_src"
+./autogen.sh
+mkgrub() {
+    grub_target="$1"
+    grub_platform="$2"
+    grub_build_dir="$workdir/grub-src-${grub_target}-${grub_platform}"
+    mkdir "$grub_build_dir"
+    cd "$grub_build_dir"
+    "$grub_src/configure" --prefix="$prefix" --program-prefix= --target=$grub_target --with-platform=$grub_platform --disable-nls --disable-efiemu --disable-grub-emu-usb --disable-grub-emu-sdl --disable-grub-mkfont --disable-grub-mount --disable-device-mapper --disable-libzfs MAKEINFO=/bin/true
+    make -j$cpus install
+    cd "$grub_src"
+}
+mkgrub i386 pc
+mkgrub i386 efi
+mkgrub x86_64 efi
+
+mkdir -p $target/boot/grub
+mkdir -p $target/efi/boot
+platforms="i386-pc i386-efi x86_64-efi"
+for platform in $platforms ; do
+    mkdir $target/boot/grub/$platform
+    for suffix in img lst mod ; do
+        cp "$prefix"/lib/grub/$platform/*.$suffix "$target/boot/grub/$platform/"
+    done
+done
+$prefix/bin/grub-mkimage -O i386-pc --output=$target/boot/grub/core.img --prefix=/boot/grub biosdisk fat part_msdos part_gpt iso9660
+$prefix/bin/grub-mkimage -O i386-efi --output=$target/efi/boot/bootia32.efi --prefix=/boot/grub fat part_msdos part_gpt iso9660
+$prefix/bin/grub-mkimage -O x86_64-efi --output=$target/efi/boot/bootx64.efi --prefix=/boot/grub fat part_msdos part_gpt iso9660
+# Workaround for syslinux 5 bug booting lnxboot.img
+cat $target/boot/grub/i386-pc/lnxboot.img $target/boot/grub/core.img > $target/boot/grub/lnxcore.img
+rm $target/boot/grub/core.img
+
+mkdir -p $target/boot/mcu
+mkdir -p $target/boot/mcu.first
+mkdir -p $target/boot/syslinux
+cp -r $BITS/Documentation $target/boot/
+cp $BITS/syslinux/* $target/boot/syslinux/
+# copy menu files
+cp -r $BITS/cfg $target/boot/
+cp -r $BITS/python $target/boot/
+rm -rf $target/boot/cfg/nodist/ $target/boot/python/nodist/
+mkdir $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/__future__.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/_abcoll.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/_weakrefset.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/abc.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/argparse.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/atexit.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/bdb.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/bisect.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/cmd.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/codecs.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/collections.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/ConfigParser.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/contextlib.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/copy.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/copy_reg.py $target/boot/python/lib/
+mkdir $target/boot/python/lib/ctypes
+cp $PYTHON_SRC/Lib/ctypes/__init__.py $target/boot/python/lib/ctypes/
+cp $PYTHON_SRC/Lib/ctypes/_endian.py $target/boot/python/lib/ctypes/
+cp $PYTHON_SRC/Lib/difflib.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/dis.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/dummy_thread.py $target/boot/python/lib/
+cp -r $PYTHON_SRC/Lib/encodings $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/fnmatch.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/formatter.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/functools.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/genericpath.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/getopt.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/gettext.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/heapq.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/inspect.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/keyword.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/locale.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/linecache.py $target/boot/python/lib/
+mkdir $target/boot/python/lib/logging
+cp $PYTHON_SRC/Lib/logging/__init__.py $target/boot/python/lib/logging/
+cp $PYTHON_SRC/Lib/opcode.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/pdb.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/pkgutil.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/posixpath.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/pprint.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/pydoc.py $target/boot/python/lib/
+cp -r $PYTHON_SRC/Lib/pydoc_data $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/re.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/repr.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/rlcompleter.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/sre_compile.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/sre_constants.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/sre_parse.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/stat.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/string.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/StringIO.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/struct.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/textwrap.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/timeit.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/token.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/tokenize.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/traceback.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/types.py $target/boot/python/lib/
+cp -r $PYTHON_SRC/Lib/unittest $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/UserDict.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/uuid.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/warnings.py $target/boot/python/lib/
+cp $PYTHON_SRC/Lib/weakref.py $target/boot/python/lib/
+cat > $target/boot/python/bitsversion.py <<END
+buildid = "$buildid"
+buildnum = "$buildnum"
+END
+{
+    echo '# Built-in configuration defaults.'
+    echo '# Do not edit; edit /boot/bits-cfg.txt instead.'
+    echo 'defaults = """'
+    cat ${BITS}/bits-cfg.txt
+    echo '"""'
+} > $target/boot/python/bitsconfigdefaults.py
+cp $BITS/bits-cfg.txt $target/boot/
+echo 'source /boot/cfg/toplevel.cfg' > $target/boot/grub/grub.cfg
+sed "s/@@BUILDID@@/$buildid/g; s/@@BUILDNUM@@/$buildnum/g" $BITS/README.txt > $target/boot/README.txt
+cp $BITS/NEWS.txt $target/boot/NEWS.txt
+
+# Add a 512k preallocated file, full of newlines, to hold BITS logs.
+yes '' | head -c 524288 > $target/boot/bits-log.txt
+
+# Include source code
+mkdir $target/boot/src
+tar -czf $target/boot/src/grub.tar.gz -C $grub_src_orig/.. $(basename $grub_src_orig)
+tar -czf $target/boot/src/acpica-unix2.tar.gz -C $BITS/.. acpica-unix2
+tar -czf $target/boot/src/Python.tar.gz -C $BITS/.. Python
+tar -czf $target/boot/src/fdlibm.tar.gz -C $BITS/.. fdlibm
+tar -czf $target/boot/src/bits-$buildnum.tar.gz --exclude='*nodist*' --exclude=.git --exclude-from=$BITS/.gitignore -C $BITS/.. $(basename $BITS)
+
+# Compile Python for the host system, and use it to compile Python source to
+# bytecode
+PYTHON_HOST_SRC="$workdir/python-host"
+cp -a "$PYTHON_SRC" "$PYTHON_HOST_SRC"
+(cd $PYTHON_HOST_SRC && ./configure && make -j$cpus)
+bytecodecompile() {
+    $PYTHON_HOST_SRC/python -m compileall $1
+    # Set the mtime to zero in all bytecode files, since GRUB2 (and thus our
+    # implementation of fstat) doesn't support mtime.
+    find $1 -name '*.pyc' | while read bytecode ; do
+        dd if=/dev/zero of=$bytecode bs=4 count=1 seek=1 conv=notrunc
+    done
+}
+bytecodecompile $target/boot/python
+
+# Copy local files if enabled
+if $localfiles ; then
+    if [ -d $BITS/local-files ] ; then
+        cp -dr $BITS/local-files/* $target/
+    fi
+fi
+
+# Build the zip file
+cp $BITS/INSTALL.txt $target
+cp $BITS/COPYING $target/boot/
+rm -f $BITS/bits-$buildnum.iso
+$prefix/bin/grub-mkrescue -o $BITS/bits-$buildnum.iso $target
+cp $BITS/bits-$buildnum.iso $BITS/bits-latest.iso
+cp $BITS/bits-$buildnum.iso $target/
+distzip=$BITS/bits-$buildnum.zip
+rm -f $distzip
+(cd $workdir && zip -qr $distzip bits-$buildnum/)
+cp $distzip $BITS/bits-latest.zip
+
+# Generate nodist variant
+if [ -f $BITS/COPYING.nodist ] ; then
+    cp $BITS/COPYING.nodist $target/boot/
+    cp -r $BITS/cfg/nodist $target/boot/cfg/
+    cp -r $BITS/python/nodist $target/boot/python/
+    bytecodecompile $target/boot/python/nodist
+    rm -f $target/bits-$buildnum.iso
+    rm $target/boot/src/bits-$buildnum.tar.gz
+    tar -czf $target/boot/src/bits-$buildnum-nodist.tar.gz --exclude=.git --exclude-from=$BITS/.gitignore -C $BITS/.. $(basename $BITS)
+    rm -f $BITS/bits-$buildnum-nodist.iso
+    $prefix/bin/grub-mkrescue -o $BITS/bits-$buildnum-nodist.iso $target
+    cp $BITS/bits-$buildnum-nodist.iso $BITS/bits-latest-nodist.iso
+    cp $BITS/bits-$buildnum-nodist.iso $target/
+    mv $workdir/bits-$buildnum $workdir/bits-$buildnum-nodist
+    distzip=$BITS/bits-$buildnum-nodist.zip
+    rm -f $distzip
+    (cd $workdir && zip -qr $distzip bits-$buildnum-nodist/)
+    cp $distzip $BITS/bits-latest-nodist.zip
+fi
